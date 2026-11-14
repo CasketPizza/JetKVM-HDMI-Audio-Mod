@@ -30,6 +30,14 @@ The first local build may take quite a while and download substantial tooling. K
    .\Install.ps1 -DeviceIP 192.168.1.100
    ```
 
+   **Important: `192.168.1.100` is only an example.** Replace it with the IP address of **your JetKVM**, not your Windows PC, router, or WSL machine. Use the same IP you enter in your browser to open JetKVM. For example, if you access the device at `http://192.168.1.207`, install with:
+
+   ```powershell
+   .\Install.ps1 -DeviceIP 192.168.1.207
+   ```
+
+   If you're unsure of your JetKVM's IP, check the device list in your router or your JetKVM network settings.
+
 4. Answer **Y/N** for audio, black theme, and Fill Window. Enter an optional SSH key path in WSL (for example `~/.ssh/id_ed25519`).
 5. Review the source-version and device warnings; type **INSTALL** to confirm.
 
