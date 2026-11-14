@@ -1,0 +1,973 @@
+diff --git a/audio.go b/audio.go
+index ad15276..92f0f0a 100644
+--- a/audio.go
++++ b/audio.go
+@@ -8,6 +8,7 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/jetkvm/kvm/internal/audio"
+@@ -16,12 +17,17 @@ import (
+ )
+ 
+ var (
+-	audioCancel  context.CancelFunc
+-	audioStopped chan struct{}
+-	audioTrack   *webrtc.TrackLocalStaticSample
+-	audioMu      sync.Mutex
++	audioCancel     context.CancelFunc
++	audioStopped    chan struct{}
++	audioTrack      *webrtc.TrackLocalStaticSample
++	audioMu         sync.Mutex
++	liveAudioVolume atomic.Int32
+ )
+ 
++func init() {
++	liveAudioVolume.Store(100)
++}
++
+ func startAudio(track *webrtc.TrackLocalStaticSample) {
+ 	audioMu.Lock()
+ 	defer audioMu.Unlock()
+@@ -70,14 +76,96 @@ func stopAudioLocked() {
+ // the handle is dead — typically a USB gadget rebuild or host reattach.
+ const reopenThreshold = 5
+ 
+-func runAudioCapture(ctx context.Context, track *webrtc.TrackLocalStaticSample, stopped chan<- struct{}) {
+-	defer close(stopped)
++const (
++	audioSourceHDMI = "hdmi"
++	audioSourceUSB  = "usb"
++)
+ 
++// configuredAudioSource defaults to HDMI for existing installations.
++func configuredAudioSource() string {
++	if config != nil && config.AudioSource == audioSourceUSB {
++		return audioSourceUSB
++	}
++	return audioSourceHDMI
++}
++
++func runAudioCapture(ctx context.Context, track *webrtc.TrackLocalStaticSample, stopped chan<- struct{}) {
+ 	codec := audio.CodecPCMU
+ 	if strings.EqualFold(track.Codec().MimeType, webrtc.MimeTypeG722) {
+ 		codec = audio.CodecG722
+ 	}
+ 
++	// The HDMI I2S driver can wake in ~40 ms bursts although each encoded
++	// frame contains 20 ms. Keep ALSA reads independent of RTP packet timing.
++	const (
++		frameDuration  = 20 * time.Millisecond
++		queueCapacity  = 8 // no more than 160 ms of buffered audio
++		startThreshold = 3 // prime with 60 ms before sending
++	)
++	frames := make(chan []byte, queueCapacity)
++	producerDone := make(chan struct{})
++	var capturedFrames atomic.Uint64
++	var discardedFrames atomic.Uint64
++	go func() {
++		defer close(producerDone)
++		captureAudioFrames(ctx, codec, frames, &capturedFrames, &discardedFrames)
++	}()
++	defer func() {
++		<-producerDone
++		close(stopped)
++	}()
++
++	audioLogger.Info().Str("codec", codec.String()).Msg("audio sender started")
++	defer audioLogger.Info().Msg("audio sender stopped")
++
++	packetTicker := time.NewTicker(frameDuration)
++	defer packetTicker.Stop()
++	statsTicker := time.NewTicker(10 * time.Second)
++	defer statsTicker.Stop()
++	sample := media.Sample{Duration: frameDuration}
++	primed := false
++	var sent, underruns uint64
++	var prevCaptured, prevDiscarded uint64
++
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-statsTicker.C:
++			captured := capturedFrames.Load()
++			discarded := discardedFrames.Load()
++			audioLogger.Info().Uint64("captured_10s", captured-prevCaptured).
++				Uint64("sent_10s", sent).Uint64("underruns_10s", underruns).
++				Uint64("queue_drops_10s", discarded-prevDiscarded).
++				Int("queued", len(frames)).Msg("audio stream pacing")
++			prevCaptured, prevDiscarded = captured, discarded
++			sent, underruns = 0, 0
++		case <-packetTicker.C:
++			if !primed {
++				if len(frames) < startThreshold {
++					continue
++				}
++				primed = true
++			}
++			select {
++			case payload := <-frames:
++				sample.Data = payload
++				if err := track.WriteSample(sample); err != nil {
++					audioLogger.Warn().Err(err).Msg("audio sample write failed")
++				}
++				sent++
++			default:
++				// Re-prime after an underrun to absorb the next burst.
++				primed = false
++				underruns++
++			}
++		}
++	}
++}
++
++// The ALSA handle and codec live exclusively in this producer. Encoder
++// output is reused on every call, so copy each frame before queuing it.
++func captureAudioFrames(ctx context.Context, codec audio.Codec, frames chan []byte, capturedFrames, discardedFrames *atomic.Uint64) {
+ 	capture, err := openCaptureWithBackoff(ctx)
+ 	if err != nil {
+ 		return
+@@ -87,8 +175,8 @@ func runAudioCapture(ctx context.Context, track *webrtc.TrackLocalStaticSample,
+ 	audioLogger.Info().Str("codec", codec.String()).Msg("audio capture started")
+ 	defer audioLogger.Info().Msg("audio capture stopped")
+ 
+-	sample := media.Sample{Duration: 20 * time.Millisecond}
+ 	consecutiveErrors := 0
++	lastFrameAt := time.Now()
+ 
+ 	for {
+ 		select {
+@@ -97,15 +185,30 @@ func runAudioCapture(ctx context.Context, track *webrtc.TrackLocalStaticSample,
+ 		default:
+ 		}
+ 
+-		payload, err := capture.ReadEncoded(codec)
++		// Browser-side gain controls playback volume without touching the
++		// embedded device's real-time ALSA/encoder path.
++		payload, err := capture.ReadEncoded(codec, 100)
+ 		if err != nil {
+ 			if errors.Is(err, audio.ErrNoAudioData) {
+-				// Partial period or idle ALSA — back off ~half a frame so we
+-				// don't spin while the buffer fills.
++				// A missing HDMI clock may leave ALSA idle without
++				// producing a hard error. Reopen on a prolonged stall.
++				if time.Since(lastFrameAt) >= 3*time.Second {
++					audioLogger.Warn().Msg("HDMI audio capture idle; reopening ALSA")
++					capture.Close()
++					next, openErr := openCaptureWithBackoff(ctx)
++					if openErr != nil {
++						return
++					}
++					capture = next
++					consecutiveErrors = 0
++					lastFrameAt = time.Now()
++				}
++				// ALSA already waited for input; avoid adding up to half a
++				// packet of extra delay to a partial 20 ms capture frame.
+ 				select {
+ 				case <-ctx.Done():
+ 					return
+-				case <-time.After(10 * time.Millisecond):
++				case <-time.After(2 * time.Millisecond):
+ 				}
+ 				continue
+ 			}
+@@ -129,19 +232,34 @@ func runAudioCapture(ctx context.Context, track *webrtc.TrackLocalStaticSample,
+ 		if len(payload) == 0 {
+ 			continue
+ 		}
+-
+-		sample.Data = payload
+-		if err := track.WriteSample(sample); err != nil {
+-			audioLogger.Warn().Err(err).Msg("audio sample write failed")
+-			time.Sleep(100 * time.Millisecond)
++		lastFrameAt = time.Now()
++		capturedFrames.Add(1)
++		encoded := append([]byte(nil), payload...)
++		select {
++		case <-ctx.Done():
++			return
++		case frames <- encoded:
++		default:
++			// Drop the oldest audio if the sender falls behind, keeping
++			// latency bounded rather than blocking the capture loop.
++			select {
++			case <-frames:
++				discardedFrames.Add(1)
++			default:
++			}
++			select {
++			case <-ctx.Done():
++				return
++			case frames <- encoded:
++			}
+ 		}
+ 	}
+ }
+ 
+ // openCaptureWithBackoff opens the ALSA capture device, retrying with
+ // exponential backoff (capped at 2 s) until success or ctx cancellation.
+-// Re-resolves the card on every attempt so a USB re-enumeration that hands
+-// the gadget a new card number is picked up automatically.
++// Re-resolves the selected capture card on every attempt, so USB gadget
++// re-enumeration or changes to the HDMI capture card number are handled.
+ func openCaptureWithBackoff(ctx context.Context) (*audio.ALSACapture, error) {
+ 	backoff := 100 * time.Millisecond
+ 	for {
+@@ -163,12 +281,19 @@ func openCaptureWithBackoff(ctx context.Context) (*audio.ALSACapture, error) {
+ 	}
+ }
+ 
+-// alsaCaptureDevice returns the ALSA device for the UAC1 gadget card.
++// alsaCaptureDevice selects HDMI or USB gadget capture according to settings.
+ func alsaCaptureDevice() string {
+-	if card, ok := findALSACard("UAC1Gadget"); ok {
++	if configuredAudioSource() == audioSourceUSB {
++		if card, ok := findALSACard("UAC1Gadget"); ok {
++			return "hw:" + strconv.Itoa(card) + ",0"
++		}
++		return "hw:1,0"
++	}
++
++	if card, ok := findALSACard("tc358743"); ok {
+ 		return "hw:" + strconv.Itoa(card) + ",0"
+ 	}
+-	return "hw:1,0"
++	return "hw:0,0"
+ }
+ 
+ func findALSACard(cardID string) (int, bool) {
+diff --git a/config.go b/config.go
+index 32b3b65..3525872 100644
+--- a/config.go
++++ b/config.go
+@@ -123,6 +123,8 @@ type Config struct {
+ 	NativeMaxRestart     uint                 `json:"native_max_restart_attempts"`
+ 	MqttConfig           *MQTTConfig          `json:"mqtt_config"`
+ 	AudioEnabled         bool                 `json:"audio_enabled"`
++	AudioSource          string               `json:"audio_source"`
++	AudioVolumePercent   int                  `json:"audio_volume_percent"`
+ }
+ 
+ // GetUpdateAPIURL returns the update API URL
+@@ -206,6 +208,8 @@ func getDefaultConfig() Config {
+ 			return c
+ 		}(),
+ 		DefaultLogLevel:      "WARN",
++		AudioSource:          audioSourceHDMI,
++		AudioVolumePercent:   100,
+ 		VideoQualityFactor:   1.0,
+ 		VideoCodecPreference: "auto",
+ 		MqttConfig: &MQTTConfig{
+@@ -287,10 +291,6 @@ func LoadConfig() {
+ 		loadedConfig.UsbDevices.Audio = defaultUsbDevices.Audio
+ 	}
+ 
+-	if !loadedConfig.UsbDevices.Audio {
+-		loadedConfig.AudioEnabled = false
+-	}
+-
+ 	if loadedConfig.NetworkConfig == nil {
+ 		loadedConfig.NetworkConfig = getDefaultConfig().NetworkConfig
+ 	}
+@@ -303,6 +303,14 @@ func LoadConfig() {
+ 		loadedConfig.MqttConfig = getDefaultConfig().MqttConfig
+ 	}
+ 
++	// Older configurations have no audio source; preserve HDMI as the default.
++	if loadedConfig.AudioSource != audioSourceUSB {
++		loadedConfig.AudioSource = audioSourceHDMI
++	}
++	if loadedConfig.AudioVolumePercent < 0 || loadedConfig.AudioVolumePercent > 200 {
++		loadedConfig.AudioVolumePercent = 100
++	}
++
+ 	// fixup old keyboard layout value
+ 	if loadedConfig.KeyboardLayout == "en_US" {
+ 		loadedConfig.KeyboardLayout = "en-US"
+@@ -328,6 +336,7 @@ func LoadConfig() {
+ 	}
+ 
+ 	config = &loadedConfig
++	liveAudioVolume.Store(int32(config.AudioVolumePercent))
+ 
+ 	logging.GetRootLogger().UpdateLogLevel(config.DefaultLogLevel)
+ 
+diff --git a/internal/audio/alsa_capture_cgo.go b/internal/audio/alsa_capture_cgo.go
+index e73398f..b0b31d8 100644
+--- a/internal/audio/alsa_capture_cgo.go
++++ b/internal/audio/alsa_capture_cgo.go
+@@ -163,7 +163,9 @@ static int jk_configure_capture(jk_alsa_capture *capture, int format, unsigned i
+ 	if (err < 0) goto fail_prepare;
+ 	err = jk_alsa.pcm_start(capture->pcm);
+ 	if (err < 0) goto fail_start_stream;
+-	err = jk_alsa.pcm_nonblock(capture->pcm, 0);
++        // Keep reads non-blocking: a switched HDMI source must not trap readi().
++        // pcm_wait() already handles waiting for available frames.
++        err = jk_alsa.pcm_nonblock(capture->pcm, 1);
+ 	if (err < 0) goto fail_blocking_mode;
+ 
+ 	capture->channels = channels;
+@@ -236,14 +238,28 @@ static jk_alsa_capture *jk_alsa_capture_open(const char *device, int format, uns
+ 	return capture;
+ }
+ 
++static int jk_alsa_capture_recover(jk_alsa_capture *capture, int err) {
++        int rc = jk_alsa.pcm_recover(capture->pcm, err, 1);
++        if (rc < 0) {
++                return rc;
++        }
++        // An XRUN recovery leaves capture prepared, not necessarily running.
++        if (err == -EPIPE) {
++                rc = jk_alsa.pcm_start(capture->pcm);
++                if (rc < 0) {
++                        return rc;
++                }
++        }
++        return 0;
++}
++
+ static int jk_alsa_capture_read(jk_alsa_capture *capture, void *buffer, unsigned long frames) {
+ 	int wait_rc = jk_alsa.pcm_wait(capture->pcm, 100);
+ 	if (wait_rc == 0) {
+ 		return 0;
+ 	}
+ 	if (wait_rc < 0) {
+-		int recovered = jk_alsa.pcm_recover(capture->pcm, wait_rc, 1);
+-		return recovered >= 0 ? 0 : wait_rc;
++                return jk_alsa_capture_recover(capture, wait_rc);
+ 	}
+ 
+ 	snd_pcm_sframes_t rc = jk_alsa.pcm_readi(capture->pcm, buffer, frames);
+@@ -252,16 +268,10 @@ static int jk_alsa_capture_read(jk_alsa_capture *capture, void *buffer, unsigned
+ 	}
+ 
+ 	if (rc == -EAGAIN) {
+-		jk_alsa.pcm_wait(capture->pcm, 100);
+-		return 0;
+-	}
+-
+-	int recovered = jk_alsa.pcm_recover(capture->pcm, (int)rc, 1);
+-	if (recovered >= 0) {
+ 		return 0;
+ 	}
+ 
+-	return (int)rc;
++        return jk_alsa_capture_recover(capture, (int)rc);
+ }
+ 
+ static void jk_alsa_capture_close(jk_alsa_capture *capture) {
+@@ -282,12 +292,13 @@ import (
+ )
+ 
+ type ALSACapture struct {
+-	handle      unsafe.Pointer
+-	pcm16       []int16
+-	pcmu        []byte
+-	g722        []byte
+-	mono16k     []int16
+-	g722Encoder *G722Encoder
++	pendingFrames int
++	handle        unsafe.Pointer
++	pcm16         []int16
++	pcmu          []byte
++	g722          []byte
++	mono16k       []int16
++	g722Encoder   *G722Encoder
+ }
+ 
+ func OpenALSACapture(device string) (*ALSACapture, error) {
+@@ -301,7 +312,7 @@ func OpenALSACapture(device string) (*ALSACapture, error) {
+ 		C.uint(CaptureSampleRate),
+ 		C.uint(CaptureChannels),
+ 		C.ulong(CaptureFrameSize),
+-		C.uint(4),
++		C.uint(8), // Allow 160 ms of capture buffering to absorb scheduling spikes.
+ 		(*C.char)(unsafe.Pointer(&errBuf[0])),
+ 		C.int(len(errBuf)),
+ 	)
+@@ -320,10 +331,11 @@ func OpenALSACapture(device string) (*ALSACapture, error) {
+ 	return capture, nil
+ }
+ 
+-func (c *ALSACapture) ReadEncoded(codec Codec) ([]byte, error) {
++func (c *ALSACapture) ReadEncoded(codec Codec, volumePercent int) ([]byte, error) {
+ 	if err := c.readPCM(); err != nil {
+ 		return nil, err
+ 	}
++	applyCaptureVolume(c.pcm16, volumePercent)
+ 
+ 	switch codec {
+ 	case CodecG722:
+@@ -335,21 +347,25 @@ func (c *ALSACapture) ReadEncoded(codec Codec) ([]byte, error) {
+ 	}
+ }
+ 
+-// readPCM fills c.pcm16 with exactly CaptureFrameSize stereo frames from ALSA.
+-// Returns ErrNoAudioData on a short or empty read so the caller emits no frame
+-// for this cycle (the encoders depend on the full buffer being valid).
++// readPCM accumulates short ALSA reads into one complete 20 ms stereo frame.
++// The encoders must never see a partly filled buffer.
+ func (c *ALSACapture) readPCM() error {
++	remaining := CaptureFrameSize - c.pendingFrames
++	offset := c.pendingFrames * CaptureChannels
+ 	rc := C.jk_alsa_capture_read(
+ 		(*C.jk_alsa_capture)(c.handle),
+-		unsafe.Pointer(&c.pcm16[0]),
+-		C.ulong(CaptureFrameSize),
++		unsafe.Pointer(&c.pcm16[offset]),
++		C.ulong(remaining),
+ 	)
+ 	if rc < 0 {
++		c.pendingFrames = 0
+ 		return fmt.Errorf("snd_pcm_readi: %d", int(rc))
+ 	}
+-	if int(rc) < CaptureFrameSize {
++	c.pendingFrames += int(rc)
++	if c.pendingFrames < CaptureFrameSize {
+ 		return ErrNoAudioData
+ 	}
++	c.pendingFrames = 0
+ 	return nil
+ }
+ 
+diff --git a/internal/audio/alsa_capture_stub.go b/internal/audio/alsa_capture_stub.go
+index b71c337..3a71600 100644
+--- a/internal/audio/alsa_capture_stub.go
++++ b/internal/audio/alsa_capture_stub.go
+@@ -10,6 +10,6 @@ func OpenALSACapture(device string) (*ALSACapture, error) {
+ 	return nil, fmt.Errorf("ALSA audio capture is not available for this build: %s", device)
+ }
+ 
+-func (*ALSACapture) ReadEncoded(Codec) ([]byte, error) { return nil, ErrNoAudioData }
++func (*ALSACapture) ReadEncoded(Codec, int) ([]byte, error) { return nil, ErrNoAudioData }
+ 
+ func (*ALSACapture) Close() error { return nil }
+diff --git a/internal/audio/volume.go b/internal/audio/volume.go
+new file mode 100644
+index 0000000..3121ac6
+--- /dev/null
++++ b/internal/audio/volume.go
+@@ -0,0 +1,27 @@
++package audio
++
++// applyCaptureVolume adjusts the unencoded signed 16-bit PCM before it is
++// downmixed and encoded for WebRTC. Values above 100% amplify, saturating
++// instead of wrapping when the signal would exceed the PCM range.
++func applyCaptureVolume(pcm []int16, percent int) {
++	if percent == 100 {
++		return
++	}
++	if percent <= 0 {
++		clear(pcm)
++		return
++	}
++	if percent > 200 {
++		percent = 200
++	}
++
++	for i, sample := range pcm {
++		amplified := int32(sample) * int32(percent) / 100
++		if amplified > 32767 {
++			amplified = 32767
++		} else if amplified < -32768 {
++			amplified = -32768
++		}
++		pcm[i] = int16(amplified)
++	}
++}
+diff --git a/internal/audio/volume_test.go b/internal/audio/volume_test.go
+new file mode 100644
+index 0000000..0056112
+--- /dev/null
++++ b/internal/audio/volume_test.go
+@@ -0,0 +1,30 @@
++package audio
++
++import (
++	"reflect"
++	"testing"
++)
++
++func TestApplyCaptureVolume(t *testing.T) {
++	tests := []struct {
++		name    string
++		percent int
++		want    []int16
++	}{
++		{"mute", 0, []int16{0, 0, 0, 0}},
++		{"half", 50, []int16{5000, -5000, 15000, -15000}},
++		{"unchanged", 100, []int16{10000, -10000, 30000, -30000}},
++		{"boost", 150, []int16{15000, -15000, 32767, -32768}},
++		{"max", 200, []int16{20000, -20000, 32767, -32768}},
++		{"clamped", 300, []int16{20000, -20000, 32767, -32768}},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := []int16{10000, -10000, 30000, -30000}
++			applyCaptureVolume(got, tt.percent)
++			if !reflect.DeepEqual(got, tt.want) {
++				t.Fatalf("got %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
+diff --git a/jsonrpc.go b/jsonrpc.go
+index 6669a82..4e293c3 100644
+--- a/jsonrpc.go
++++ b/jsonrpc.go
+@@ -53,7 +53,10 @@ type BacklightSettings struct {
+ }
+ 
+ type AudioConfig struct {
+-	Enabled bool `json:"enabled"`
++	Enabled          bool   `json:"enabled"`
++	RequestedEnabled bool   `json:"requested_enabled,omitempty"`
++	Source           string `json:"source,omitempty"`
++	VolumePercent    int    `json:"volume_percent"`
+ }
+ 
+ func writeJSONRPCResponse(response JSONRPCResponse, session *Session) {
+@@ -380,19 +383,31 @@ func rpcGetBacklightSettings() (*BacklightSettings, error) {
+ }
+ 
+ func rpcGetAudioConfig() (*AudioConfig, error) {
+-	return &AudioConfig{Enabled: effectiveAudioEnabled()}, nil
++	return &AudioConfig{
++		Enabled:          effectiveAudioEnabled(),
++		RequestedEnabled: config.AudioEnabled,
++		Source:           configuredAudioSource(),
++		VolumePercent:    config.AudioVolumePercent,
++	}, nil
+ }
+ 
+ func rpcSetAudioConfig(params AudioConfig) error {
+-	enabled := params.Enabled
+-	if enabled && (config.UsbDevices == nil || !config.UsbDevices.Audio) {
+-		enabled = false
++	source := params.Source
++	if source == "" {
++		// Keep compatibility with clients that only send {enabled: bool}.
++		source = configuredAudioSource()
+ 	}
+-	if config.AudioEnabled == enabled {
++	if source != audioSourceHDMI && source != audioSourceUSB {
++		return fmt.Errorf("invalid audio source: %q", source)
++	}
++	previousSource := configuredAudioSource()
++	if config.AudioEnabled == params.Enabled && previousSource == source {
+ 		return nil
+ 	}
+-	config.AudioEnabled = enabled
+-	if !effectiveAudioEnabled() {
++	config.AudioEnabled = params.Enabled
++	config.AudioSource = source
++	if !effectiveAudioEnabled() || previousSource != source {
++		// Release the previous capture device before the UI reconnects WebRTC.
+ 		stopAudio()
+ 	}
+ 	if err := SaveConfig(); err != nil {
+@@ -401,6 +416,23 @@ func rpcSetAudioConfig(params AudioConfig) error {
+ 	return nil
+ }
+ 
++// Live updates are not persisted until the UI has stopped dragging the slider.
++// This avoids repeatedly rewriting flash storage while adjusting volume.
++func rpcSetAudioVolume(percent int, persist bool) error {
++	if percent < 0 || percent > 200 {
++		return fmt.Errorf("invalid audio volume: %d (expected 0-200)", percent)
++	}
++	liveAudioVolume.Store(int32(percent))
++	if !persist {
++		return nil
++	}
++	if config.AudioVolumePercent == percent {
++		return nil
++	}
++	config.AudioVolumePercent = percent
++	return SaveConfig()
++}
++
+ const (
+ 	devModeFile = "/userdata/jetkvm/devmode.enable"
+ 	sshKeyDir   = "/userdata/dropbear/.ssh"
+@@ -993,9 +1025,6 @@ func updateUsbRelatedConfig() error {
+ }
+ 
+ func rpcSetUsbDevices(usbDevices usbgadget.Devices) error {
+-	if !usbDevices.Audio {
+-		config.AudioEnabled = false
+-	}
+ 	config.UsbDevices = &usbDevices
+ 	if !effectiveAudioEnabled() {
+ 		stopAudio()
+@@ -1018,9 +1047,6 @@ func rpcSetUsbDeviceState(device string, enabled bool) error {
+ 		config.UsbDevices.SerialConsole = enabled
+ 	case "audio":
+ 		config.UsbDevices.Audio = enabled
+-		if !enabled {
+-			config.AudioEnabled = false
+-		}
+ 	default:
+ 		return fmt.Errorf("invalid device: %s", device)
+ 	}
+@@ -1409,6 +1435,7 @@ var rpcHandlers = map[string]RPCHandler{
+ 	"getBacklightSettings":       {Func: rpcGetBacklightSettings},
+ 	"setAudioConfig":             {Func: rpcSetAudioConfig, Params: []string{"params"}},
+ 	"getAudioConfig":             {Func: rpcGetAudioConfig},
++	"setAudioVolume":             {Func: rpcSetAudioVolume, Params: []string{"percent", "persist"}},
+ 	"getDCPowerState":            {Func: rpcGetDCPowerState},
+ 	"setDCPowerState":            {Func: rpcSetDCPowerState, Params: []string{"enabled"}},
+ 	"setDCRestoreState":          {Func: rpcSetDCRestoreState, Params: []string{"state"}},
+diff --git a/ui/src/routes/devices.$id.settings.audio.tsx b/ui/src/routes/devices.$id.settings.audio.tsx
+index 0fa5bd2..204b01e 100644
+--- a/ui/src/routes/devices.$id.settings.audio.tsx
++++ b/ui/src/routes/devices.$id.settings.audio.tsx
+@@ -1,7 +1,7 @@
+ import { useCallback, useEffect, useState } from "react";
+ import { LinkButton } from "@components/Button";
+-import { Checkbox } from "@components/Checkbox";
+ import { GridCard } from "@components/Card";
++import { SelectMenuBasic } from "@components/SelectMenuBasic";
+ import { SettingsItem } from "@components/SettingsItem";
+ import { SettingsPageHeader } from "@components/SettingsPageheader";
+ import { JsonRpcResponse, useJsonRpc } from "@hooks/useJsonRpc";
+@@ -9,24 +9,38 @@ import { useRTCStore } from "@hooks/stores";
+ import notifications from "@/notifications";
+ import { m } from "@localizations/messages.js";
+ import { LuInfo } from "react-icons/lu";
++import { readBrowserAudioVolume, writeBrowserAudioVolume } from "@/utils/browserAudioVolume";
+ 
+ interface AudioConfig {
+   enabled: boolean;
++  requested_enabled?: boolean;
++  source?: "hdmi" | "usb";
++  volume_percent?: number;
+ }
+ 
++type AudioSource = "hdmi" | "usb";
++type AudioSelection = AudioSource | "off";
++
+ interface UsbDeviceConfig {
+   audio?: boolean;
+ }
+ 
+ export default function SettingsAudioRoute() {
+   const { send } = useJsonRpc();
+-  const [enabled, setEnabled] = useState<boolean | null>(null);
++  const [audioConfig, setAudioConfig] = useState<{ enabled: boolean; source: AudioSource } | null>(
++    null,
++  );
+   const [usbAudioEnabled, setUsbAudioEnabled] = useState<boolean | null>(null);
++  const [volumePercent, setVolumePercent] = useState(readBrowserAudioVolume);
+ 
+   useEffect(() => {
+     send("getAudioConfig", {}, (resp: JsonRpcResponse) => {
+       if ("error" in resp) return console.error(resp.error);
+-      setEnabled((resp.result as AudioConfig).enabled);
++      const result = resp.result as AudioConfig;
++      setAudioConfig({
++        enabled: result.requested_enabled ?? result.enabled,
++        source: result.source === "usb" ? "usb" : "hdmi",
++      });
+     });
+ 
+     send("getUsbDevices", {}, (resp: JsonRpcResponse) => {
+@@ -39,14 +53,26 @@ export default function SettingsAudioRoute() {
+     });
+   }, [send]);
+ 
++  const handleVolumeChange = useCallback((next: number) => {
++    setVolumePercent(next);
++    writeBrowserAudioVolume(next);
++  }, []);
++
+   const handleChange = useCallback(
+-    (next: boolean) => {
+-      const previous = enabled;
+-      setEnabled(next);
+-      send("setAudioConfig", { params: { enabled: next } }, (resp: JsonRpcResponse) => {
++    (next: AudioSelection) => {
++      if (!audioConfig || (next === "usb" && usbAudioEnabled === false)) return;
++
++      const previous = audioConfig;
++      const updated = {
++        enabled: next !== "off",
++        // Preserve the source when audio is disabled, ready for next time.
++        source: next === "off" ? previous.source : next,
++      };
++      setAudioConfig(updated);
++      send("setAudioConfig", { params: updated }, (resp: JsonRpcResponse) => {
+         if ("error" in resp) {
+           notifications.error(resp.error.data || m.unknown_error());
+-          setEnabled(previous);
++          setAudioConfig(previous);
+           return;
+         }
+         // Close the WebRTC connection before reloading. Firefox's soft
+@@ -57,27 +83,61 @@ export default function SettingsAudioRoute() {
+         window.location.reload();
+       });
+     },
+-    [enabled, send],
++    [audioConfig, send, usbAudioEnabled],
+   );
+ 
+-  const audioBlockedByUsb = usbAudioEnabled === false;
++  const audioBlockedByUsb =
++    audioConfig?.enabled === true && audioConfig.source === "usb" && usbAudioEnabled === false;
++
++  const selection: AudioSelection = audioConfig?.enabled ? audioConfig.source : "off";
+ 
+   return (
+     <div className="space-y-4">
+-      <SettingsPageHeader title={m.audio_title()} description={m.audio_page_description()} />
++      <SettingsPageHeader
++        title={m.audio_title()}
++        description="Capture HDMI or USB audio and stream it to your browser."
++      />
+       <div className="space-y-3">
+         <SettingsItem
+-          title={m.audio_enable_title()}
++          title="Audio source"
+           badge="Experimental"
+-          description={m.audio_enable_description()}
++          description="Choose where JetKVM captures sound for your browser."
+         >
+-          <Checkbox
+-            checked={enabled ?? false}
+-            disabled={enabled === null || usbAudioEnabled === null || audioBlockedByUsb}
+-            aria-describedby={audioBlockedByUsb ? "audio-usb-disabled-hint" : undefined}
+-            onChange={e => handleChange(e.target.checked)}
++          <SelectMenuBasic
++            size="SM"
++            label=""
++            value={selection}
++            disabled={audioConfig === null || usbAudioEnabled === null}
++            options={[
++              { value: "hdmi", label: "HDMI (follows your HDMI switch)" },
++              {
++                value: "usb",
++                label: "USB (from connected host)",
++                disabled: usbAudioEnabled === false,
++              },
++              { value: "off", label: "Disabled" },
++            ]}
++            onChange={e => handleChange(e.target.value as AudioSelection)}
+           />
+         </SettingsItem>
++        <SettingsItem
++          title="Audio volume"
++          description="Controls only this browser. 100% is unchanged; boost above 100% may distort."
++        >
++          <div className="flex items-center gap-3">
++            <input
++              type="range"
++              min="0"
++              max="200"
++              step="5"
++              aria-label="Audio volume"
++              value={volumePercent}
++              onChange={e => handleVolumeChange(Number(e.target.value))}
++              className="h-2 w-40 cursor-pointer appearance-none rounded-lg bg-gray-200 dark:bg-gray-700"
++            />
++            <span className="w-12 text-right text-sm tabular-nums">{volumePercent}%</span>
++          </div>
++        </SettingsItem>
+         {audioBlockedByUsb && (
+           <GridCard>
+             <div
+diff --git a/ui/src/utils/browserAudioVolume.ts b/ui/src/utils/browserAudioVolume.ts
+new file mode 100644
+index 0000000..e0dec25
+--- /dev/null
++++ b/ui/src/utils/browserAudioVolume.ts
+@@ -0,0 +1,24 @@
++export const browserAudioVolumeKey = "jetkvm-browser-audio-volume";
++export const browserAudioVolumeEvent = "jetkvm-browser-audio-volume-change";
++
++export function readBrowserAudioVolume(): number {
++  if (typeof window === "undefined") return 100;
++  try {
++    const stored = window.localStorage.getItem(browserAudioVolumeKey);
++    if (stored === null) return 100;
++    const value = Number(stored);
++    return Number.isFinite(value) ? Math.max(0, Math.min(200, value)) : 100;
++  } catch {
++    return 100;
++  }
++}
++
++export function writeBrowserAudioVolume(percent: number): void {
++  const value = Math.max(0, Math.min(200, Math.round(percent)));
++  try {
++    window.localStorage.setItem(browserAudioVolumeKey, String(value));
++  } catch {
++    // The slider still works for this tab when storage is unavailable.
++  }
++  window.dispatchEvent(new CustomEvent<number>(browserAudioVolumeEvent, { detail: value }));
++}
+diff --git a/usb.go b/usb.go
+index d768c50..13dfe32 100644
+--- a/usb.go
++++ b/usb.go
+@@ -20,10 +20,14 @@ func effectiveUsbDevices() *usbgadget.Devices {
+ }
+ 
+ func effectiveAudioEnabled() bool {
+-	return config != nil &&
+-		config.UsbDevices != nil &&
+-		config.AudioEnabled &&
+-		config.UsbDevices.Audio
++	if config == nil || !config.AudioEnabled {
++		return false
++	}
++	// USB audio needs the gadget to be enabled; HDMI capture does not.
++	if configuredAudioSource() == audioSourceUSB {
++		return config.UsbDevices != nil && config.UsbDevices.Audio
++	}
++	return true
+ }
+ 
+ // initUsbGadget initializes the USB gadget.
+diff --git a/webrtc.go b/webrtc.go
+index 27020aa..b09e4a9 100644
+--- a/webrtc.go
++++ b/webrtc.go
+@@ -147,9 +147,9 @@ func negotiateAudioCodec(offerSDP string) string {
+ 	return ""
+ }
+ 
+-// attachAudioTrack adds an outgoing audio track when audio is enabled, the USB
+-// gadget allows audio, and the browser advertised a codec we support. No-op
+-// otherwise; the SDP answer just leaves the audio m-line inactive.
++// attachAudioTrack adds an outgoing audio track when the selected capture
++// source is enabled and the browser advertised a supported codec. If the
++// source is unavailable, the SDP answer leaves the audio m-line inactive.
+ func (s *Session) attachAudioTrack(offerSDP string) error {
+ 	if !effectiveAudioEnabled() {
+ 		webrtcLogger.Debug().Msg("audio disabled by device config")
+diff --git a/ui/src/components/WebRTCVideo.tsx b/ui/src/components/WebRTCVideo.tsx
+index 36a4be61f2ca86b119a8831474b0e5a170f9ebab..7496be763b4e5e76e34002a06062aa56059371c3 100644
+--- a/ui/src/components/WebRTCVideo.tsx
++++ b/ui/src/components/WebRTCVideo.tsx
+@@ -21,6 +21,7 @@
+ import { keys } from "@/keyboardMappings";
+ import notifications from "@/notifications";
+ import { m } from "@localizations/messages.js";
++import { browserAudioVolumeEvent, readBrowserAudioVolume } from "@/utils/browserAudioVolume";
+ 
+ const initialHdmiErrorGraceMs = 2500;
+ 
+@@ -33,12 +34,14 @@
+ }) {
+   // Video and stream related refs and states
+   const videoElm = useRef<HTMLVideoElement>(null);
+-  const audioElm = useRef<HTMLAudioElement>(null);
++  const audioContextRef = useRef<AudioContext | null>(null);
++  const audioGainRef = useRef<GainNode | null>(null);
+   const fullscreenContainerRef = useRef<HTMLDivElement>(null);
+   const { mediaStream, mediaStreamTrackVersion, peerConnectionState } = useRTCStore();
+   const [isPlaying, setIsPlaying] = useState(false);
+   const [audioAutoplayBlocked, setAudioAutoplayBlocked] = useState(false);
+   const [audioEnabled, setAudioEnabled] = useState(false);
++  const [audioVolumePercent, setAudioVolumePercent] = useState(readBrowserAudioVolume);
+   const [isPointerLockActive, setIsPointerLockActive] = useState(false);
+   const [isKeyboardLockActive, setIsKeyboardLockActive] = useState(false);
+ 
+@@ -504,23 +507,59 @@
+     [peerConnection?.connectionState, sendRpc],
+   );
+ 
+-  // Audio plays through a separate <audio> element because the <video> is
+-  // muted (kept muted so video autoplay isn't blocked when no user gesture
+-  // has been recorded). If the browser blocks audio autoplay, the autoplay
+-  // overlay surfaces a click target.
++  // Keep gain and its playback mixing in the browser. The JetKVM only sends
++  // untouched audio frames, so adjusting volume cannot stall capture.
++  useEffect(() => {
++    const updateVolume = () => setAudioVolumePercent(readBrowserAudioVolume());
++    window.addEventListener(browserAudioVolumeEvent, updateVolume);
++    window.addEventListener("storage", updateVolume);
++    return () => {
++      window.removeEventListener(browserAudioVolumeEvent, updateVolume);
++      window.removeEventListener("storage", updateVolume);
++    };
++  }, []);
++
++  useEffect(() => {
++    const context = audioContextRef.current;
++    const gain = audioGainRef.current;
++    if (context && gain) {
++      gain.gain.setTargetAtTime(audioVolumePercent / 100, context.currentTime, 0.005);
++    }
++  }, [audioVolumePercent]);
++
++  // The video element stays muted for autoplay. Play only the incoming audio
++  // tracks through Web Audio, with a GainNode for 0-200% local volume.
+   useEffect(
+     function updateAudioStream() {
+-      const elm = audioElm.current;
+-      if (!elm || !mediaStream || !audioEnabled) return;
+-
+-      elm.srcObject = mediaStream;
+-      elm
+-        .play()
+-        .then(() => setAudioAutoplayBlocked(false))
+-        .catch(() => setAudioAutoplayBlocked(true));
++      const tracks = mediaStream?.getAudioTracks();
++      if (!audioEnabled || !tracks?.length) return;
++
++      const context = new AudioContext({ latencyHint: "interactive" });
++      const source = context.createMediaStreamSource(new MediaStream(tracks));
++      const gain = context.createGain();
++      gain.gain.value = readBrowserAudioVolume() / 100;
++      source.connect(gain);
++      gain.connect(context.destination);
++      audioContextRef.current = context;
++      audioGainRef.current = gain;
++      let cleanedUp = false;
++      setAudioAutoplayBlocked(context.state !== "running");
++      void context.resume().then(
++        () => {
++          if (!cleanedUp) setAudioAutoplayBlocked(false);
++        },
++        () => {
++          if (!cleanedUp) setAudioAutoplayBlocked(true);
++        },
++      );
+ 
+       return () => {
+-        elm.srcObject = null;
++        cleanedUp = true;
++        audioContextRef.current = null;
++        audioGainRef.current = null;
++        source.disconnect();
++        gain.disconnect();
++        void context.close();
+         setAudioAutoplayBlocked(false);
+       };
+     },
+@@ -733,7 +772,6 @@
+                           "animate-slideUpFade": isPlaying,
+                         })}
+                       />
+-                      {audioEnabled && <audio ref={audioElm} autoPlay playsInline hidden />}
+                       <OcrOverlay />
+                       {peerConnection?.connectionState == "connected" && !hasConnectionIssues && (
+                         <div
+@@ -747,8 +785,8 @@
+                               show={hasNoAutoPlayPermissions}
+                               onPlayClick={() => {
+                                 videoElm.current?.play();
+-                                audioElm.current
+-                                  ?.play()
++                                audioContextRef.current
++                                  ?.resume()
+                                   .then(() => setAudioAutoplayBlocked(false))
+                                   .catch(() => undefined);
+                               }}

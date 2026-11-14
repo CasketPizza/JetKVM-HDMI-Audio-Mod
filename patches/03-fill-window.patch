@@ -1,0 +1,201 @@
+diff --git a/ui/src/components/ActionBar.tsx b/ui/src/components/ActionBar.tsx
+index 7b5e2fd..979f19a 100644
+--- a/ui/src/components/ActionBar.tsx
++++ b/ui/src/components/ActionBar.tsx
+@@ -5,6 +5,7 @@ import {
+   LuExternalLink,
+   LuHardDrive,
+   LuMaximize,
++  LuMonitor,
+   LuScanText,
+   LuSettings,
+   LuSignal,
+@@ -37,8 +38,10 @@ import { m } from "@localizations/messages.js";
+ 
+ export default function Actionbar({
+   requestFullscreen,
++  requestWindowFill,
+ }: {
+   requestFullscreen: () => Promise<void>;
++  requestWindowFill: () => void;
+ }) {
+   const { navigateTo } = useDeviceUiNavigation();
+   const { isVirtualKeyboardEnabled, setVirtualKeyboardEnabled } = useHidStore();
+@@ -347,26 +350,35 @@ export default function Actionbar({
+                 onClick={() => window.close()}
+               />
+             ) : (
+-              <SplitButtonGroup>
+-                <SplitButtonPrimary
+-                  icon={LuMaximize}
+-                  label={m.action_bar_fullscreen()}
+-                  onClick={() => requestFullscreen()}
++              <>
++                <Button
++                  size="XS"
++                  theme="light"
++                  text="Fill Window"
++                  LeadingIcon={LuMonitor}
++                  onClick={requestWindowFill}
+                 />
+-                <SplitButtonCaret
+-                  menuItems={[
+-                    {
+-                      label: m.action_bar_compact_window(),
+-                      icon: LuExternalLink,
+-                      onClick: () => {
+-                        const url = new URL(window.location.href);
+-                        url.searchParams.set("embed", "");
+-                        window.open(url.toString(), "_blank", "noopener");
++                <SplitButtonGroup>
++                  <SplitButtonPrimary
++                    icon={LuMaximize}
++                    label={m.action_bar_fullscreen()}
++                    onClick={() => requestFullscreen()}
++                  />
++                  <SplitButtonCaret
++                    menuItems={[
++                      {
++                        label: m.action_bar_compact_window(),
++                        icon: LuExternalLink,
++                        onClick: () => {
++                          const url = new URL(window.location.href);
++                          url.searchParams.set("embed", "");
++                          window.open(url.toString(), "_blank", "noopener");
++                        },
+                       },
+-                    },
+-                  ]}
+-                />
+-              </SplitButtonGroup>
++                    ]}
++                  />
++                </SplitButtonGroup>
++              </>
+             )}
+           </div>
+         </div>
+diff --git a/ui/src/components/WebRTCVideo.tsx b/ui/src/components/WebRTCVideo.tsx
+index 36a4be61f2ca86b119a8831474b0e5a170f9ebab..c6f98090f74700b517aae2a0ed206942bd53b86b 100644
+--- a/ui/src/components/WebRTCVideo.tsx
++++ b/ui/src/components/WebRTCVideo.tsx
+@@ -41,6 +41,17 @@
+   const [audioEnabled, setAudioEnabled] = useState(false);
+   const [isPointerLockActive, setIsPointerLockActive] = useState(false);
+   const [isKeyboardLockActive, setIsKeyboardLockActive] = useState(false);
++  const [isWindowFill, setIsWindowFill] = useState(false);
++
++  // Window fill uses the browser viewport without invoking the Fullscreen API.
++  useEffect(() => {
++    if (!isWindowFill) return;
++    const previousOverflow = document.body.style.overflow;
++    document.body.style.overflow = "hidden";
++    return () => {
++      document.body.style.overflow = previousOverflow;
++    };
++  }, [isWindowFill]);
+ 
+   const { send: sendRpc } = useJsonRpc();
+ 
+@@ -679,17 +690,32 @@
+   }, [videoSaturation, videoBrightness, videoContrast]);
+ 
+   return (
+-    <div className="grid h-full w-full grid-rows-(--grid-layout)">
+-      <div className="flex min-h-[39.5px] flex-col">
+-        <div className="flex flex-col">
+-          <fieldset disabled={peerConnection?.connectionState !== "connected"} className="contents">
+-            <Actionbar requestFullscreen={requestFullscreen} />
+-            <MacroBar />
+-          </fieldset>
++    <div
++      className={cx(
++        "grid w-full",
++        isWindowFill
++          ? "fixed inset-0 z-15 h-dvh grid-rows-1 overflow-hidden bg-black"
++          : "h-full grid-rows-(--grid-layout)",
++      )}
++    >
++      {!isWindowFill && (
++        <div className="flex min-h-[39.5px] flex-col">
++          <div className="flex flex-col">
++            <fieldset
++              disabled={peerConnection?.connectionState !== "connected"}
++              className="contents"
++            >
++              <Actionbar
++                requestFullscreen={requestFullscreen}
++                requestWindowFill={() => setIsWindowFill(true)}
++              />
++              <MacroBar />
++            </fieldset>
++          </div>
+         </div>
+-      </div>
+-
+-      <div ref={containerRef} className="h-full overflow-hidden">
++      )}
++
++      <div ref={containerRef} className="h-full min-h-0 overflow-hidden">
+         <div className="relative h-full">
+           <div
+             className={cx(
+@@ -704,8 +730,13 @@
+               <div className="flex h-full flex-col">
+                 <div className="grid grow grid-rows-(--grid-bodyFooter) overflow-hidden">
+                   {/* In relative mouse mode and under https, we enable the pointer lock, and to do so we need a bar to show the user to click on the video to enable mouse control */}
+-                  <PointerLockBar show={showPointerLockBar} />
+-                  <div className="relative mx-4 my-2 flex items-center justify-center overflow-hidden">
++                  <PointerLockBar show={!isWindowFill && showPointerLockBar} />
++                  <div
++                    className={cx(
++                      "relative flex items-center justify-center overflow-hidden",
++                      isWindowFill ? "m-0 h-full" : "mx-4 my-2",
++                    )}
++                  >
+                     <div
+                       ref={fullscreenContainerRef}
+                       className="relative flex h-full w-full items-center justify-center"
+@@ -729,12 +760,24 @@
+                             hdmiError ||
+                             hasConnectionIssues ||
+                             peerConnectionState !== "connected",
+-                          "opacity-60!": showPointerLockBar,
++                          "opacity-60!": showPointerLockBar && !isWindowFill,
+                           "animate-slideUpFade": isPlaying,
+                         })}
+                       />
+                       {audioEnabled && <audio ref={audioElm} autoPlay playsInline hidden />}
+                       <OcrOverlay />
++                      {isWindowFill && (
++                        <div className="group/window-fill absolute top-0 left-1/2 z-20 flex h-14 w-56 -translate-x-1/2 items-start justify-center pt-2">
++                          <button
++                            type="button"
++                            onClick={() => setIsWindowFill(false)}
++                            className="cursor-pointer rounded-md border border-white/20 bg-neutral-900/95 px-4 py-1.5 text-sm font-semibold text-white opacity-0 shadow-lg backdrop-blur-sm transition-opacity duration-150 group-hover/window-fill:opacity-100 hover:bg-neutral-800 focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-blue-400"
++                            aria-label="Exit window fill mode"
++                          >
++                            Exit Window Fill
++                          </button>
++                        </div>
++                      )}
+                       {peerConnection?.connectionState == "connected" && !hasConnectionIssues && (
+                         <div
+                           style={{ animationDuration: "500ms" }}
+@@ -758,14 +801,14 @@
+                       )}
+                     </div>
+                   </div>
+-                  <VirtualKeyboard />
++                  {!isWindowFill && <VirtualKeyboard />}
+                 </div>
+               </div>
+             </div>
+           </div>
+         </div>
+       </div>
+-      {!hideStatusBar && (
++      {!hideStatusBar && !isWindowFill && (
+         <div>
+           <InfoBar />
+         </div>
