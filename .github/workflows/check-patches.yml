@@ -1,0 +1,27 @@
+name: Verify selectable source patches
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  patch-check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [A, T, F, AT, AF, TF, ATF]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply selected patches to official app 0.5.10 source
+        env:
+          FEATURE_SET: ${{ matrix.features }}
+        shell: bash
+        run: |
+          options=()
+          if [[ "$FEATURE_SET" == *A* ]]; then options+=(--audio); fi
+          if [[ "$FEATURE_SET" == *T* ]]; then options+=(--theme); fi
+          if [[ "$FEATURE_SET" == *F* ]]; then options+=(--fill); fi
+          bash scripts/install.sh --root "$GITHUB_WORKSPACE" \
+            --ref release/0.5.10 --preview "${options[@]}"
